@@ -24,7 +24,7 @@ Here's how I fixed it:
 
 The command injection only works on 1.5.13 — it does NOT work on older versions (I tried on the stock firmware first, got `NO_AUTH` / no effect). So the flow is: flash stock → boot → update to 1.5.13 → inject → SSH → unlock → factory reset.
 
-Big thanks to [@gaglians](https://github.com/bkerler/mtkclient/issues/88) and [@bnjdg](https://github.com/bkerler/mtkclient/issues/88) for the dumps and images that made this possible.
+Huge thanks to [@bnjdg](https://github.com/bkerler/mtkclient/issues/88) who helped a lot and provided many of the images and build scripts used to get the router back, and to [@gaglians](https://github.com/bkerler/mtkclient/issues/88) for the initial dumps and patch findings that made this possible.
 
 ---
 
@@ -88,7 +88,7 @@ See `RECOVERY_GUIDE.md` for full details.
 - Original mtkclient by [bkerler](https://github.com/bkerler/mtkclient)
 - NAND/PMT patches based on findings from [GitHub issue #88](https://github.com/bkerler/mtkclient/issues/88) by @gaglians
 - Custom DA loader from Quectel RG500L-EU-AC QuecOpen firmware package
-- Stock boot/rootfs images provided by @bnjdg
+- Stock boot/rootfs images and build scripts provided by @bnjdg
 - Unlock guide and 1.5.13 firmware by [Mr-Tezar](https://github.com/Mr-Tezar/ZLT-X28-Firmware-1.5.13-simLock)
 
 ## License
