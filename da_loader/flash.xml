@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<flash-mode>
+    <version>1.0</version>
+    <project>evb6890v1_64_cpe_nand</project>
+    <dagent>DA_BR.bin</dagent>
+    <scatter>../MT6890_openwrt_scatter.xml</scatter>
+    <contact>Jungo.Lin</contact>
+    <build_time>2023-06-28 04:13:19</build_time>
+    <build_version>gem-mp-1907-mp1.V1.27_QUECTEL_1907MP1_RG500L_P38</build_version>
+</flash-mode>

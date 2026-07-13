@@ -1,0 +1,1107 @@
+diff --git a/mtkclient/Library/DA/daconfig.py b/mtkclient/Library/DA/daconfig.py
+index 3d5f2b2..9a234de 100644
+--- a/mtkclient/Library/DA/daconfig.py
++++ b/mtkclient/Library/DA/daconfig.py
+@@ -112,7 +112,16 @@ class DAconfig(metaclass=LogBase):
+                 self.parse_da_loader(loader, self.dasetup)
+         else:
+             if not os.path.exists(loader):
+-                self.warning(f"Couldn't open {loader}")
++                self.warning(f"Couldn't open {loader}, falling back to default loaders")
++                loaders = []
++                for root, dirs, files in os.walk(self.pathconfig.get_loader_path(), topdown=False):
++                    for file in files:
++                        if "MTK_AllInOne_DA" in file or "MTK_DA" in file:
++                            loaders.append(os.path.join(root, file))
++                loaders = sorted(loaders)[::-1]
++                for dloader in loaders:
++                    self.parse_da_loader(dloader, self.dasetup)
++                self.loader = None
+             else:
+                 self.info(f"Using custom loader: {loader}")
+                 self.parse_da_loader(loader, self.dasetup)
+@@ -205,6 +214,7 @@ class DAconfig(metaclass=LogBase):
+         return False
+ 
+     def setup(self):
++        custom_loader = self.loader
+         dacode = self.config.chipconfig.dacode
+         if dacode in self.dasetup:
+             loaders = self.dasetup[dacode]
+@@ -215,7 +225,8 @@ class DAconfig(metaclass=LogBase):
+                             if loader.v6:
+                                 self.config.chipconfig.damode = DAmodes.XML
+                             self.da_loader = loader
+-                            self.loader = loader.loader
++                            if custom_loader is None:
++                                self.loader = loader.loader
+         if self.da_loader is None and dacode != 0x6261:
+             self.error("No da_loader config set up")
+         self.mtk.daloader.daconfig.da_loader = self.da_loader
+diff --git a/mtkclient/Library/DA/mtk_da_handler.py b/mtkclient/Library/DA/mtk_da_handler.py
+index 00ab920..acdcce5 100644
+--- a/mtkclient/Library/DA/mtk_da_handler.py
++++ b/mtkclient/Library/DA/mtk_da_handler.py
+@@ -128,6 +128,8 @@ class DaHandler(metaclass=LogBase):
+                 mtk.daloader.reinit()
+                 mtk.reinited = True
+                 return mtk
++            elif mtk.port.cdc.connected and mtk.config.target_config is None:
++                mtk.preloader.init(directory=directory)
+         if mtk.config.target_config is None:
+             self.info("Please disconnect, start mtkclient and reconnect.")
+             return None
+@@ -352,9 +354,16 @@ class DaHandler(metaclass=LogBase):
+                             readlength = length
+                         if display:
+                             self.info(f'Dumping partition "{rpartition.name}"')
+-                        if self.mtk.daloader.readflash(addr=(rpartition.sector * self.config.pagesize) + offset,
+-                                                       length=readlength,
+-                                                       filename=partfilename, parttype=parttype, display=display):
++                        is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
++                        if is_nand and offset == 0 and hasattr(self.mtk.daloader, 'readflash_by_name'):
++                            read_ok = self.mtk.daloader.readflash_by_name(partname=rpartition.name,
++                                                                          filename=partfilename,
++                                                                          display=display)
++                        else:
++                            read_ok = self.mtk.daloader.readflash(addr=(rpartition.sector * self.config.pagesize) + offset,
++                                                                   length=readlength,
++                                                                   filename=partfilename, parttype=parttype, display=display)
++                        if read_ok:
+                             if display:
+                                 self.info(f"Dumped sector {str(rpartition.sector)} with sector count " +
+                                           f"{str(rpartition.sectors)} as {partfilename}.")
+@@ -413,7 +422,9 @@ class DaHandler(metaclass=LogBase):
+             wf.write(data)
+ 
+         count_gpt = 0
+-        for partition in guid_gpt.partentries:
++        partentries = guid_gpt if isinstance(guid_gpt, list) else guid_gpt.partentries
++        is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
++        for partition in partentries:
+             partitionname = partition.name
+             if partition.name in skip:
+                 continue
+@@ -423,12 +434,18 @@ class DaHandler(metaclass=LogBase):
+                     f"Dumping partition {str(partition.name)} with sector count {str(partition.sectors)} " +
+                     f"as {filename}.")
+ 
+-            if self.mtk.daloader.readflash(addr=partition.sector * self.config.pagesize,
+-                                           length=partition.sectors * self.config.pagesize,
+-                                           filename=filename,
+-                                           parttype=parttype,
+-                                           display=display):
++            if is_nand and hasattr(self.mtk.daloader, 'readflash_by_name'):
++                ok = self.mtk.daloader.readflash_by_name(partname=partition.name,
++                                                         filename=filename,
++                                                         display=display)
++            else:
++                ok = self.mtk.daloader.readflash(addr=partition.sector * self.config.pagesize,
++                                                 length=partition.sectors * self.config.pagesize,
++                                                 filename=filename,
++                                                 parttype=parttype,
++                                                 display=display)
+ 
++            if ok:
+                 count_gpt += 1
+                 if display:
+                     self.info(f"Dumped partition {str(partition.name)} as {str(filename)}.")
+@@ -437,7 +454,7 @@ class DaHandler(metaclass=LogBase):
+                 if display:
+                     self.error(f"Failed to dump partition {str(partition.name)} as {str(filename)}.")
+ 
+-        partitions_for_read = len(guid_gpt.partentries) - len(skip)
++        partitions_for_read = len(partentries) - len(skip)
+         if count_gpt == partitions_for_read:
+             if display:
+                 self.info("All Dumped partitions success.")
+@@ -531,6 +548,7 @@ class DaHandler(metaclass=LogBase):
+             exit(0)
+         if parttype == "user" or parttype is None:
+             i = 0
++            is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
+             for partition in partitions:
+                 partfilename = filenames[i]
+                 i += 1
+@@ -543,10 +561,15 @@ class DaHandler(metaclass=LogBase):
+                 res = self.mtk.daloader.detect_partition(partition, parttype)
+                 if res[0]:
+                     rpartition = res[1]
+-                    if self.mtk.daloader.writeflash(addr=rpartition.sector * self.config.pagesize,
+-                                                    length=rpartition.sectors * self.config.pagesize,
+-                                                    filename=partfilename,
+-                                                    parttype=parttype):
++                    if is_nand and hasattr(self.mtk.daloader, 'writeflash_by_name'):
++                        write_ok = self.mtk.daloader.writeflash_by_name(partname=rpartition.name,
++                                                                         filename=partfilename)
++                    else:
++                        write_ok = self.mtk.daloader.writeflash(addr=rpartition.sector * self.config.pagesize,
++                                                                 length=rpartition.sectors * self.config.pagesize,
++                                                                 filename=partfilename,
++                                                                 parttype=parttype)
++                    if write_ok:
+                         print(
+                             f"Wrote {partfilename} to sector {str(rpartition.sector)} with " +
+                             f"sector count {str(rpartition.sectors)}.")
+@@ -1254,6 +1277,14 @@ class DaHandler(metaclass=LogBase):
+             data, guid_gpt = mtk.daloader.get_gpt()
+             if not guid_gpt:
+                 self.error('Error reading gpt, please read whole flash using "mtk rf flash.bin".')
++            elif isinstance(guid_gpt, list):
++                # PMT partition list returned (NAND device)
++                self.info("Partition table (PMT):")
++                for p in guid_gpt:
++                    if hasattr(p, 'name'):
++                        start = getattr(p, 'start', getattr(p, 'sector', 0))
++                        size = getattr(p, 'size', getattr(p, 'sectors', 0))
++                        self.info(f"  {p.name:<20} start=0x{start:08x}  size=0x{size:08x}")
+             else:
+                 guid_gpt.print()
+         elif cmd == "r":
+diff --git a/mtkclient/Library/DA/mtk_daloader.py b/mtkclient/Library/DA/mtk_daloader.py
+index 659d9e2..e1604f3 100644
+--- a/mtkclient/Library/DA/mtk_daloader.py
++++ b/mtkclient/Library/DA/mtk_daloader.py
+@@ -279,7 +279,12 @@ class DAloader(metaclass=LogBase):
+             return [False, fpartitions]
+         else:
+             data, partitions = self.da.partition.read_pmt()
+-            return [True, partitions]
++            if not partitions:
++                return [False, []]
++            for partition in partitions:
++                if hasattr(partition, 'name') and partition.name.lower() == partitionname.lower():
++                    return [True, partition]
++            return [False, partitions]
+ 
+     def get_partition_data(self, parttype=None):
+         if self.partition_table_category() == "GPT":
+@@ -291,7 +296,7 @@ class DAloader(metaclass=LogBase):
+                 return guid_gpt.partentries
+         else:
+             data, partitions = self.da.partition.read_pmt()
+-            return [True, partitions]
++            return partitions if partitions else []
+ 
+     def get_gpt(self, parttype=None) -> tuple:
+         if self.partition_table_category() == "GPT":
+@@ -333,6 +338,18 @@ class DAloader(metaclass=LogBase):
+     def readflash(self, addr, length, filename, parttype, display=True):
+         return self.da.readflash(addr=addr, length=length, filename=filename, parttype=parttype, display=display)
+ 
++    def readflash_by_name(self, partname: str, filename: str, display: bool = True):
++        if hasattr(self.da, 'readflash_by_name'):
++            return self.da.readflash_by_name(partname=partname, filename=filename, display=display)
++        self.error("readflash_by_name not supported by current DA mode")
++        return False
++
++    def writeflash_by_name(self, partname: str, filename: str, display: bool = True):
++        if hasattr(self.da, 'writeflash_by_name'):
++            return self.da.writeflash_by_name(partname=partname, filename=filename, display=display)
++        self.error("writeflash_by_name not supported by current DA mode")
++        return False
++
+     def get_packet_length(self):
+         if self.flashmode == DAmodes.XFLASH:
+             pt = self.da.get_packet_length()
+@@ -388,8 +405,11 @@ class DAloader(metaclass=LogBase):
+             pg.done()
+ 
+     def partition_table_category(self):
+-        # if self.flashmode == damodes.XFLASH:
+-        #    return self.xft.get_partition_table_category()
++        # For NAND flash, use the DA XML CMD:READ-PARTITION-TABLE (PMT path)
++        # instead of trying to read a GPT from flash sectors.
++        if hasattr(self, 'daconfig') and hasattr(self.daconfig, 'storage') and \
++                getattr(self.daconfig.storage, 'flashtype', None) == 'nand':
++            return "PMT"
+         return "GPT"
+ 
+     def poke(self, addr: int, data: bytes or bytearray, registers:bool=False):
+diff --git a/mtkclient/Library/DA/storage.py b/mtkclient/Library/DA/storage.py
+index 0b7489b..be80e22 100644
+--- a/mtkclient/Library/DA/storage.py
++++ b/mtkclient/Library/DA/storage.py
+@@ -354,4 +354,15 @@ class Storage(metaclass=LogBase):
+                 parttype = EmmcPartitionType.MTK_DA_EMMC_PART_USER
+             self.flashsize = self.nor.available_size
+         length = min(length, self.flashsize)
++        # Some DA firmware rejects reads where length == total flash size (off-by-one
++        # in DA boundary check). Trim by one block when requesting the full flash.
++        if length > 0 and length == self.flashsize:
++            block = 0
++            if self.flashtype == "nand" and self.nand.block_size > 0:
++                block = self.nand.block_size
++            elif self.flashtype == "emmc" and self.emmc.block_size > 0:
++                block = self.emmc.block_size
++            if block == 0:
++                block = 0x20000  # 128 KB default block
++            length -= block
+         return [storage, parttype, length]
+diff --git a/mtkclient/Library/DA/xmlflash/extension/v6.py b/mtkclient/Library/DA/xmlflash/extension/v6.py
+index b882ee7..b478da1 100755
+--- a/mtkclient/Library/DA/xmlflash/extension/v6.py
++++ b/mtkclient/Library/DA/xmlflash/extension/v6.py
+@@ -208,7 +208,11 @@ class XmlFlashExt(metaclass=LogBase):
+ 
+     def find_register_xml_cmd_func(self) -> Optional[int]:
+         register_xml_off = self.archtools.find_string_xref("CMD:REBOOT")
++        if register_xml_off is None:
++            return None
+         bl_off = self.archtools.get_next_bl_from_off(register_xml_off)
++        if bl_off is None:
++            return None
+         reg_cmd_addr = self.archtools.get_bl_target(bl_off)
+         return reg_cmd_addr
+ 
+@@ -246,31 +250,40 @@ class XmlFlashExt(metaclass=LogBase):
+                 register_xml_cmd = self.find_register_xml_cmd_func()
+ 
+                 # UFS
++                g_ufs_hba = 0
+                 ufs_controller_enable_offset = self.archtools.find_function_from_string("Controller enable failed\n")
+-                instr = int.from_bytes(self.da2[ufs_controller_enable_offset + 0xC:ufs_controller_enable_offset + 0x10],
+-                                       'little')
+-                if (instr & 0x9F000000) == 0x90000000:
+-                    g_ufs_hba = self.archtools.decode_adrp(instr, ufs_controller_enable_offset + 0xC + self.da2address)
+-                    if g_ufs_hba is not None:
+-                        g_ufs_hba = g_ufs_hba[0]
+-                else:
+-                    instr = int.from_bytes(
+-                        self.da2[ufs_controller_enable_offset + 0x14:ufs_controller_enable_offset + 0x14 + 4],
+-                        'little')
++                if ufs_controller_enable_offset is not None:
++                    instr = int.from_bytes(self.da2[ufs_controller_enable_offset + 0xC:ufs_controller_enable_offset + 0x10],
++                                           'little')
+                     if (instr & 0x9F000000) == 0x90000000:
+-                        g_ufs_hba = self.archtools.decode_adrp(instr,
+-                                                               ufs_controller_enable_offset + 0x14 + self.da2address)
++                        g_ufs_hba = self.archtools.decode_adrp(instr, ufs_controller_enable_offset + 0xC + self.da2address)
+                         if g_ufs_hba is not None:
+-                            g_ufs_hba = g_ufs_hba[0] + 0x8C0
+-                assert g_ufs_hba is not None, "No g_ufs_hba found"
++                            g_ufs_hba = g_ufs_hba[0]
++                    else:
++                        instr = int.from_bytes(
++                            self.da2[ufs_controller_enable_offset + 0x14:ufs_controller_enable_offset + 0x14 + 4],
++                            'little')
++                        if (instr & 0x9F000000) == 0x90000000:
++                            g_ufs_hba = self.archtools.decode_adrp(instr,
++                                                                   ufs_controller_enable_offset + 0x14 + self.da2address)
++                            if g_ufs_hba is not None:
++                                g_ufs_hba = g_ufs_hba[0] + 0x8C0
++                if g_ufs_hba == 0:
++                    self.warning("g_ufs_hba not found, skipping UFS controller patch.")
+ 
++                ufshcd_queuecommand = 0
+                 ufshcd_queuecommand_str = self.archtools.find_string_xref("[UFS] err: ufshcd_queuecommand err\n")
+                 if ufshcd_queuecommand_str is not None:
+                     first = self.archtools.get_previous_bl_from_off(ufshcd_queuecommand_str)
+-                    ufshcd_queuecommand_ptr2 = self.archtools.get_previous_bl_from_off(first)
+-                    ufshcd_queuecommand = self.archtools.get_bl_target(ufshcd_queuecommand_ptr2)
++                    if first is not None:
++                        ufshcd_queuecommand_ptr2 = self.archtools.get_previous_bl_from_off(first)
++                        if ufshcd_queuecommand_ptr2 is not None:
++                            target = self.archtools.get_bl_target(ufshcd_queuecommand_ptr2)
++                            if target is not None:
++                                ufshcd_queuecommand = target
++                if ufshcd_queuecommand == 0:
++                    self.warning("ufshcd_queuecommand not found, skipping UFS queue command patch.")
+ 
+-                assert ufshcd_queuecommand is not None, "No ufshcd_queuecommand found"
+                 ufshcd_get_free_tag = self.archtools.find_function_from_string("[UFS] ufshcd_get_free_tag fail\n")
+                 if ufshcd_get_free_tag is None:
+                     ufshcd_get_free_tag = 0
+@@ -278,20 +291,30 @@ class XmlFlashExt(metaclass=LogBase):
+                     ufshcd_get_free_tag = ufshcd_get_free_tag + self.da2address
+ 
+                 # EMMC
++                mmc_get_card = 0
+                 mmc_switch_part_offset = self.archtools.find_function_from_string("mmc_switch_part")
+-                mmc_get_card_ptr2 = self.archtools.get_next_bl_from_off(mmc_switch_part_offset)
+-                mmc_get_card = self.archtools.get_bl_target(mmc_get_card_ptr2)
++                if mmc_switch_part_offset is not None:
++                    mmc_get_card_ptr2 = self.archtools.get_next_bl_from_off(mmc_switch_part_offset)
++                    if mmc_get_card_ptr2 is not None:
++                        target = self.archtools.get_bl_target(mmc_get_card_ptr2)
++                        if target is not None:
++                            mmc_get_card = target
+ 
+-                mmc_set_part_config = self.archtools.find_function_from_string("%sset_part_config fail %x\n")
+-                if mmc_set_part_config is not None:
+-                    mmc_set_part_config = mmc_set_part_config + self.da2address
++                mmc_set_part_config = 0
++                msp = self.archtools.find_function_from_string("%sset_part_config fail %x\n")
++                if msp is not None:
++                    mmc_set_part_config = msp + self.da2address
+ 
++                mmc_rpmb_send_command = 0
+                 mmc_rpmb_offs = self.archtools.find_function_from_string("%sreq/1 fail %d\n")
+-                logl = self.archtools.get_next_bl_from_off(mmc_rpmb_offs)
+-                mmc_rpmb_send_command_ptr2 = self.archtools.get_next_bl_from_off(logl + 0x8)
+-                mmc_rpmb_send_command = self.archtools.get_bl_target(mmc_rpmb_send_command_ptr2)
+-                if mmc_rpmb_send_command is None:
+-                    mmc_rpmb_send_command = 0
++                if mmc_rpmb_offs is not None:
++                    logl = self.archtools.get_next_bl_from_off(mmc_rpmb_offs)
++                    if logl is not None:
++                        mmc_rpmb_send_command_ptr2 = self.archtools.get_next_bl_from_off(logl + 0x8)
++                        if mmc_rpmb_send_command_ptr2 is not None:
++                            target = self.archtools.get_bl_target(mmc_rpmb_send_command_ptr2)
++                            if target is not None:
++                                mmc_rpmb_send_command = target
+             else:
+                 register_ptr = daextdata.find(b"\x11\x11\x11\x11")
+                 mmc_get_card_ptr = daextdata.find(b"\x22\x22\x22\x22")
+@@ -309,13 +332,20 @@ class XmlFlashExt(metaclass=LogBase):
+                 register_xml_cmd = self.find_register_xml_cmd_func()
+ 
+                 # UFS
++                ufshcd_queuecommand = 0
+                 ufshcd_queuecommand_str = self.archtools.find_string_xref("[UFS] err: ufshcd_queuecommand err\n")
+                 if ufshcd_queuecommand_str is not None:
+                     first = self.archtools.get_previous_bl_from_off(ufshcd_queuecommand_str)
+-                    ufshcd_queuecommand_ptr2 = self.archtools.get_previous_bl_from_off(first)
+-                    ufshcd_queuecommand = self.archtools.get_bl_target(ufshcd_queuecommand_ptr2)
+-                assert ufshcd_queuecommand is not None, "No ufshcd_queuecommand found"
++                    if first is not None:
++                        ufshcd_queuecommand_ptr2 = self.archtools.get_previous_bl_from_off(first)
++                        if ufshcd_queuecommand_ptr2 is not None:
++                            target = self.archtools.get_bl_target(ufshcd_queuecommand_ptr2)
++                            if target is not None:
++                                ufshcd_queuecommand = target
++                if ufshcd_queuecommand == 0:
++                    self.warning("UFS ufshcd_queuecommand not found, skipping UFS patch.")
+ 
++                g_ufs_hba = 0
+                 ufs_controller_enable_offset = self.archtools.find_function_from_string("Controller enable failed\n")
+                 if ufs_controller_enable_offset is not None:
+                     instr = int.from_bytes(
+@@ -336,23 +366,33 @@ class XmlFlashExt(metaclass=LogBase):
+                     ufshcd_get_free_tag = ufshcd_get_free_tag + self.da2address
+ 
+                 # EMMC
++                mmc_get_card = 0
+                 mmc_switch_part_offset = self.archtools.find_function_from_string("mmc_switch_part")
+-                mmc_get_card_ptr2 = self.archtools.get_next_bl_from_off(mmc_switch_part_offset)
+-                mmc_get_card = self.archtools.get_bl_target(mmc_get_card_ptr2)
++                if mmc_switch_part_offset is not None:
++                    mmc_get_card_ptr2 = self.archtools.get_next_bl_from_off(mmc_switch_part_offset)
++                    if mmc_get_card_ptr2 is not None:
++                        target = self.archtools.get_bl_target(mmc_get_card_ptr2)
++                        if target is not None:
++                            mmc_get_card = target
+ 
+-                mmc_set_part_config = self.archtools.find_function_from_string("%sset_part_config fail %x\n")
+-                if mmc_set_part_config is not None:
+-                    mmc_set_part_config = mmc_set_part_config + self.da2address
++                mmc_set_part_config = 0
++                msp = self.archtools.find_function_from_string("%sset_part_config fail %x\n")
++                if msp is not None:
++                    mmc_set_part_config = msp + self.da2address
+ 
++                mmc_rpmb_send_command = 0
+                 mmc_rpmb_offs = self.archtools.find_function_from_string("%sreq/1 fail %d\n")
+-                logl = self.archtools.get_next_bl_from_off(mmc_rpmb_offs)
+-                mmc_rpmb_send_command_ptr2 = self.archtools.get_next_bl_from_off(logl + 0x8)
+-                mmc_rpmb_send_command = self.archtools.get_bl_target(mmc_rpmb_send_command_ptr2)
+-                if mmc_rpmb_send_command is None:
+-                    mmc_rpmb_send_command = 0
++                if mmc_rpmb_offs is not None:
++                    logl = self.archtools.get_next_bl_from_off(mmc_rpmb_offs)
++                    if logl is not None:
++                        mmc_rpmb_send_command_ptr2 = self.archtools.get_next_bl_from_off(logl + 0x8)
++                        if mmc_rpmb_send_command_ptr2 is not None:
++                            target = self.archtools.get_bl_target(mmc_rpmb_send_command_ptr2)
++                            if target is not None:
++                                mmc_rpmb_send_command = target
+ 
+             efuse_addr = self.config.chipconfig.efuse_addr
+-            if register_ptr != -1:
++            if register_ptr != -1 and register_xml_cmd is not None:
+ 
+                 length = 4
+                 if self.is_arm64:
+@@ -416,32 +456,35 @@ class XmlFlashExt(metaclass=LogBase):
+             erase_write_func = self.archtools.find_function_from_string("%s: partial_protect is enabled, start...")
+             if erase_write_func:
+                 is_partitial_protect_enabled_ptr = self.archtools.get_next_bl_from_off(erase_write_func)
+-                is_partitial_protect_enabled = self.archtools.get_bl_target(is_partitial_protect_enabled_ptr) - self.da2address
+-                if is_partitial_protect_enabled:
+-                    # MOV             W0, WZR;  RET
+-                    da2patched = self.mem_patch(da2patched, is_partitial_protect_enabled, mov_w0_wzr)
+-                    self.info("Patched partial_protect for erase/write storage.")
++                if is_partitial_protect_enabled_ptr is not None:
++                    target = self.archtools.get_bl_target(is_partitial_protect_enabled_ptr)
++                    if target is not None:
++                        is_partitial_protect_enabled = target - self.da2address
++                        # MOV             W0, WZR;  RET
++                        da2patched = self.mem_patch(da2patched, is_partitial_protect_enabled, mov_w0_wzr)
++                        self.info("Patched partial_protect for erase/write storage.")
+ 
+             flash_policy = self.archtools.find_function_from_string("hash_binding = %d\n")
+             if flash_policy:
+                 get_policy_entry_idx = self.archtools.get_next_bl_from_off(flash_policy)
+-                hash_binding = self.archtools.get_next_bl_from_off(get_policy_entry_idx + 4)
+-                img_auth = self.archtools.get_next_bl_from_off(hash_binding+4)
+-                dl_forbidden = self.archtools.get_next_bl_from_off(img_auth+4)
+-                vfy_pol = self.archtools.get_next_bl_from_off(dl_forbidden+4)
+-                dl_pol = self.archtools.get_next_bl_from_off(vfy_pol+4)
+-
+-                da2patched = self.mem_patch(da2patched, self.archtools.va_to_offset(
+-                    self.archtools.get_bl_target(hash_binding)), mov_w0_wzr)
+-                da2patched = self.mem_patch(da2patched, self.archtools.va_to_offset(
+-                    self.archtools.get_bl_target(img_auth)), mov_w0_wzr)
+-                da2patched = self.mem_patch(da2patched, self.archtools.va_to_offset(
+-                    self.archtools.get_bl_target(dl_forbidden)), mov_w0_wzr)
+-                da2patched = self.mem_patch(da2patched, self.archtools.va_to_offset(
+-                    self.archtools.get_bl_target(vfy_pol)), mov_w0_wzr)
+-                da2patched = self.mem_patch(da2patched, self.archtools.va_to_offset(
+-                    self.archtools.get_bl_target(dl_pol)), mov_w0_wzr)
+-                self.info("Patched hash binding/img_auth/vfy_pol/dl_pol.")
++                if get_policy_entry_idx is not None:
++                    hash_binding = self.archtools.get_next_bl_from_off(get_policy_entry_idx + 4)
++                    if hash_binding is not None:
++                        img_auth = self.archtools.get_next_bl_from_off(hash_binding+4)
++                        if img_auth is not None:
++                            dl_forbidden = self.archtools.get_next_bl_from_off(img_auth+4)
++                            if dl_forbidden is not None:
++                                vfy_pol = self.archtools.get_next_bl_from_off(dl_forbidden+4)
++                                if vfy_pol is not None:
++                                    dl_pol = self.archtools.get_next_bl_from_off(vfy_pol+4)
++                                    if dl_pol is not None:
++                                        for pol_off in [hash_binding, img_auth, dl_forbidden, vfy_pol, dl_pol]:
++                                            target = self.archtools.get_bl_target(pol_off)
++                                            if target is not None:
++                                                offset = self.archtools.va_to_offset(target)
++                                                if offset is not None:
++                                                    da2patched = self.mem_patch(da2patched, offset, mov_w0_wzr)
++                                        self.info("Patched hash binding/img_auth/vfy_pol/dl_pol.")
+ 
+             da_version = self.archtools.find_function_from_string("[%s] da version check, status(0x%x), CFI(0x%x)\n")
+             if da_version:
+@@ -454,11 +497,13 @@ class XmlFlashExt(metaclass=LogBase):
+                 if idx != -1:
+                     allow_read_register_ptr = self.archtools.get_previous_bl_from_off(idx)
+                     if allow_read_register_ptr:
+-                        allow_read_register = self.archtools.get_bl_target(allow_read_register_ptr) - self.da2address
+-                        mov_w0_1 = b"\x20\x00\x80\x52\xC0\x03\x5F\xD6\x20\x00\x80\x52\xC0\x03\x5F\xD6"
+-                        da2patched = self.mem_patch(da2patched, allow_read_register, mov_w0_1)
+-                        self.info("Patched read_register / write_register")
+-                        patched = True
++                        target = self.archtools.get_bl_target(allow_read_register_ptr)
++                        if target is not None:
++                            allow_read_register = target - self.da2address
++                            mov_w0_1 = b"\x20\x00\x80\x52\xC0\x03\x5F\xD6\x20\x00\x80\x52\xC0\x03\x5F\xD6"
++                            da2patched = self.mem_patch(da2patched, allow_read_register, mov_w0_1)
++                            self.info("Patched read_register / write_register")
++                            patched = True
+             else:
+                 patched = True
+ 
+@@ -471,30 +516,72 @@ class XmlFlashExt(metaclass=LogBase):
+             return da2patched
+         else:
+             print("DA2 32-Bit detected.")
++
++            # Patch partial_protect for erase/write storage (same as 64-bit path)
++            partial_protect_str = self.archtools.find_function_from_string(
++                "%s: partial_protect is enabled, start...")
++            if partial_protect_str is not None:
++                is_partitial_protect_enabled_ptr = self.archtools.get_next_bl_from_off(partial_protect_str)
++                if is_partitial_protect_enabled_ptr is not None:
++                    target = self.archtools.get_bl_target(is_partitial_protect_enabled_ptr)
++                    if target is not None:
++                        is_partitial_protect_enabled = target - self.da2address
++                        # MOV R0, #0 ; BX LR  (32-bit: return 0 = not enabled)
++                        mov_r0_0_bx_lr = b"\x00\x00\xA0\xE3\x1E\xFF\x2F\xE1"
++                        da2patched = self.mem_patch(da2patched, is_partitial_protect_enabled, mov_r0_0_bx_lr)
++                        self.info("Patched partial_protect for erase/write storage.")
++                        patched = True
++
++            # Patch flash policy / hash_binding / img_auth / dl_forbidden / vfy_pol / dl_pol
++            flash_policy = self.archtools.find_function_from_string("hash_binding = %d\n")
++            if flash_policy is not None:
++                get_policy_entry_idx = self.archtools.get_next_bl_from_off(flash_policy)
++                if get_policy_entry_idx is not None:
++                    hash_binding = self.archtools.get_next_bl_from_off(get_policy_entry_idx + 4)
++                    if hash_binding is not None:
++                        img_auth = self.archtools.get_next_bl_from_off(hash_binding + 4)
++                        if img_auth is not None:
++                            dl_forbidden = self.archtools.get_next_bl_from_off(img_auth + 4)
++                            if dl_forbidden is not None:
++                                vfy_pol = self.archtools.get_next_bl_from_off(dl_forbidden + 4)
++                                if vfy_pol is not None:
++                                    dl_pol = self.archtools.get_next_bl_from_off(vfy_pol + 4)
++                                    if dl_pol is not None:
++                                        # MOV R0, #0 ; BX LR  (return 0 for each policy check)
++                                        ret_r0_0 = b"\x00\x00\xA0\xE3\x1E\xFF\x2F\xE1"
++                                        for pol_off in [hash_binding, img_auth, dl_forbidden, vfy_pol, dl_pol]:
++                                            target = self.archtools.get_bl_target(pol_off)
++                                            if target is not None:
++                                                offset = target - self.da2address
++                                                da2patched = self.mem_patch(da2patched, offset, ret_r0_0)
++                                        self.info("Patched hash binding/img_auth/vfy_pol/dl_pol.")
++                                        patched = True
++
+             read_write_ptr = self.archtools.find_function_from_string("R/W on this address is forbidden.")
+             if read_write_ptr:
+                 # Search for LDR R0, [R9]
+                 idx2 = find_binary(da2patched, b"\x00\x00\x99\xE5", read_write_ptr)
+                 if idx2 != -1:
+                     check_allow_ptr = self.archtools.get_previous_bl_from_off(idx2)
+-                    allow_write_func = self.archtools.get_bl_target(check_allow_ptr)
+-                    if allow_write_func:
+-                        # MOV R0, #0 => MOV R0, #1
+-                        offs = allow_write_func - self.da2address
+-                        if da2patched[offs:offs+4] == b"\x00\x00\xA0\xE3":
+-                            self.info("Patched allow_read_register")
+-                            da2patched[offs:offs + 4] = b"\x01\x00\xA0\xE3"
+-                            patched = True
+-                        elif da2patched[offs:offs+4] == b"\x01\x00\xA0\xE3":
+-                            patched = True
+-                        if da2patched[offs-8:offs-8+4] == b"\x00\x00\xA0\xE3":
+-                            self.info("Patched allow_storage")
+-                            da2patched[offs-8:offs-8+4] = b"\x01\x00\xA0\xE3"
+-                            patched = True
+-                        if da2patched[offs+8:offs+8+4] == b"\x00\x00\xA0\xE3":
+-                            self.info("Patched allow_write_register")
+-                            da2patched[offs+8:offs+8+4] = b"\x01\x00\xA0\xE3"
+-                            patched = True
++                    if check_allow_ptr is not None:
++                        allow_write_func = self.archtools.get_bl_target(check_allow_ptr)
++                        if allow_write_func is not None:
++                            # MOV R0, #0 => MOV R0, #1
++                            offs = allow_write_func - self.da2address
++                            if da2patched[offs:offs+4] == b"\x00\x00\xA0\xE3":
++                                self.info("Patched allow_read_register")
++                                da2patched[offs:offs + 4] = b"\x01\x00\xA0\xE3"
++                                patched = True
++                            elif da2patched[offs:offs+4] == b"\x01\x00\xA0\xE3":
++                                patched = True
++                            if da2patched[offs-8:offs-8+4] == b"\x00\x00\xA0\xE3":
++                                self.info("Patched allow_storage")
++                                da2patched[offs-8:offs-8+4] = b"\x01\x00\xA0\xE3"
++                                patched = True
++                            if da2patched[offs+8:offs+8+4] == b"\x00\x00\xA0\xE3":
++                                self.info("Patched allow_write_register")
++                                da2patched[offs+8:offs+8+4] = b"\x01\x00\xA0\xE3"
++                                patched = True
+             if not patched:
+                 self.warning("Write not allowed not patched.")
+             if patched:
+@@ -508,14 +595,19 @@ class XmlFlashExt(metaclass=LogBase):
+ 
+             hash_bind_str = self.archtools.find_string_xref("hash_binding:%d, img_auth_required:%d\n")
+             if hash_bind_str is not None:
+-                get_log_level_ptr=self.archtools.get_previous_bl_from_off(hash_bind_str)
+-                branch_ptr = self.archtools.get_previous_bl_from_off(get_log_level_ptr-4)
+-                hash_bind_ptr = self.archtools.get_previous_bl_from_off(branch_ptr - 4)
+-                hash_bind_func = self.archtools.get_bl_target(hash_bind_ptr) - self.da2address
+-                # MOV   R1, #1 => MOV   R1, #0
+-                da2patched[hash_bind_func:hash_bind_func + 4] = b"\x00\x10\xA0\xE3"
+-                self.info("Patched hash binding")
+-                patched = True
++                get_log_level_ptr = self.archtools.get_previous_bl_from_off(hash_bind_str)
++                if get_log_level_ptr is not None:
++                    branch_ptr = self.archtools.get_previous_bl_from_off(get_log_level_ptr - 4)
++                    if branch_ptr is not None:
++                        hash_bind_ptr = self.archtools.get_previous_bl_from_off(branch_ptr - 4)
++                        if hash_bind_ptr is not None:
++                            target = self.archtools.get_bl_target(hash_bind_ptr)
++                            if target is not None:
++                                hash_bind_func = target - self.da2address
++                                # MOV   R1, #1 => MOV   R1, #0
++                                da2patched[hash_bind_func:hash_bind_func + 4] = b"\x00\x10\xA0\xE3"
++                                self.info("Patched hash binding")
++                                patched = True
+             else:
+                 self.warning("Hash binding not patched.")
+ 
+diff --git a/mtkclient/Library/DA/xmlflash/xml_cmd.py b/mtkclient/Library/DA/xmlflash/xml_cmd.py
+index 918e298..5b5bfcf 100755
+--- a/mtkclient/Library/DA/xmlflash/xml_cmd.py
++++ b/mtkclient/Library/DA/xmlflash/xml_cmd.py
+@@ -471,6 +471,17 @@ class XMLCmd(metaclass=LogBase):
+         cmd = self.create_cmd("READ-PARTITION", content)
+         return cmd
+ 
++    def cmd_write_partition_by_name(self, partition: str, mem_length: int = 0x100000,
++                                    mem_offset: int = 0x8000000):
++        content = {
++            "arg": [
++                f"<partition>{partition}</partition>",
++                f"<source_file>MEM://{hex(mem_offset)}:{hex(mem_length)}</source_file>"
++            ]
++        }
++        cmd = self.create_cmd("WRITE-PARTITION", content)
++        return cmd
++
+     def cmd_read_flash(self, partition: str = "EMMC-USER", offset: int = 0, length: int = 0x100000):
+         content = {
+             "arg": [
+diff --git a/mtkclient/Library/DA/xmlflash/xml_lib.py b/mtkclient/Library/DA/xmlflash/xml_lib.py
+index 1effbaa..8ed5a68 100755
+--- a/mtkclient/Library/DA/xmlflash/xml_lib.py
++++ b/mtkclient/Library/DA/xmlflash/xml_lib.py
+@@ -113,7 +113,7 @@ class DAXML(metaclass=LogBase):
+         while True:
+             hdr = self.usbread()
+             if len(hdr) not in [12,16]:
+-                self.error("xread: Wrong length")
++                self.error(f"xread: Wrong length ({len(hdr)} bytes: {hdr.hex() if hdr else 'empty'})")
+                 return -1, -1
+             magic = int.from_bytes(hdr[:4],'little')
+             if magic != 0xFEEEEEEF:
+@@ -505,7 +505,7 @@ class DAXML(metaclass=LogBase):
+             self.error("No upload data received. Aborting.")
+             return False
+ 
+-    def download_raw(self, result, filename: str = "", display: bool = False):
++    def download_raw(self, result, filename: str = "", display: bool = False, append_mode: bool = False):
+         rq = Queue()
+         if type(result) is UpFile:
+             # checksum = result.checksum
+@@ -518,7 +518,15 @@ class DAXML(metaclass=LogBase):
+                 length = int(tmp[2:], 16)
+                 pg = progress(total=length, prefix="Read:", guiprogress=self.mtk.config.guiprogress)
+                 self.ack()
+-                sresp = self.get_response()
++                # DA may take extra time to seek on non-zero offset reads; retry a few times
++                sresp = ""
++                for _retry in range(10):
++                    sresp = self.get_response()
++                    if sresp:
++                        break
++                    self.debug(f"download_raw: waiting for OK (attempt {_retry+1})")
++                if "OK" not in sresp:
++                    self.warning(f"download_raw: expected OK after OK@, got {sresp!r}")
+                 if "OK" in sresp:
+                     self.ack()
+                     data = bytearray()
+@@ -526,7 +534,8 @@ class DAXML(metaclass=LogBase):
+                     bytestoread = length
+                     worker = None
+                     if filename != "":
+-                        worker = Thread(target=writedata, args=(filename, rq), daemon=True)
++                        fmode = "ab" if append_mode else "wb"
++                        worker = Thread(target=writedata, args=(filename, rq, fmode), daemon=True)
+                         worker.start()
+                     while bytestoread > 0:
+                         tmp = self.get_response_data()
+@@ -654,6 +663,20 @@ class DAXML(metaclass=LogBase):
+                 self.info("Successfully booted to stage 2")
+                 self.setup_hw_init()
+                 self.change_usb_speed()
++                # DA stage 2 re-enumerates USB after speed negotiation;
++                # reconnect before SLA check (mirrors xflash_lib.py behaviour)
++                import time
++                time.sleep(1)
++                try:
++                    self.mtk.port.close(reset=False)
++                    time.sleep(2)
++                    for _ in range(20):
++                        if self.mtk.port.cdc.connect():
++                            self.info("Reconnected to DA stage 2")
++                            break
++                        time.sleep(0.5)
++                except Exception as e:
++                    self.warning(f"USB reconnect attempt failed: {e}")
+                 res = self.check_sla()
+                 if isinstance(res, bool):
+                     if not res:
+@@ -703,7 +726,11 @@ class DAXML(metaclass=LogBase):
+             self.reinit(True)
+             self.check_lifecycle()
+             if self.mtk.daloader.patch:
+-                xdata = self.xmlft.patch()
++                try:
++                    xdata = self.xmlft.patch()
++                except Exception as e:
++                    self.warning(f"DA patching skipped (modem DA has no standard patterns): {e}")
++                    xdata = None
+                 """
+                 i=0
+                 val=self.read_register(0x4006E4C0)
+@@ -712,7 +739,7 @@ class DAXML(metaclass=LogBase):
+                     i+=4
+                 """
+                 xmlcmd = self.cmd.create_cmd("CUSTOM")
+-                if self.xsend(xmlcmd):
++                if xdata is not None and self.xsend(xmlcmd):
+                     # result =
+                     data = self.get_response()
+                     if data == 'OK':
+@@ -830,12 +857,13 @@ class DAXML(metaclass=LogBase):
+                         self.cid = get_field(data, "emmc_cid")
+                 elif storagetype == "NAND":
+                     self.daconfig.storage.flashtype = "nand"
+-                    self.daconfig.storage.nand.block_size = int(get_field(data, "block_size"), 16)
+-                    self.daconfig.storage.nand.page_size = int(get_field(data, "page_size"), 16)
+-                    self.daconfig.storage.nand.spare_size = int(get_field(data, "spare_size"), 16)
+-                    self.daconfig.storage.nand.total_size = int(get_field(data, "total_size"), 16)
++                    def _hex(field): return int(get_field(data, field) or "0", 16)
++                    self.daconfig.storage.nand.block_size = _hex("block_size")
++                    self.daconfig.storage.nand.page_size = _hex("page_size")
++                    self.daconfig.storage.nand.spare_size = _hex("spare_size")
++                    self.daconfig.storage.nand.total_size = _hex("total_size")
+                     self.daconfig.storage.nand.cid = get_field(data, "id")
+-                    self.daconfig.storage.nand.page_parity_size = int(get_field(data, "page_parity_size"), 16)
++                    self.daconfig.storage.nand.page_parity_size = _hex("page_parity_size")
+                     self.daconfig.storage.nand.sub_type = get_field(data, "sub_type")
+                     self.daconfig.storage.set_flash_size()
+                 else:
+@@ -849,7 +877,7 @@ class DAXML(metaclass=LogBase):
+                                     0x10,                                                 , 1
+         """
+         data = self.get_sys_property(key="DA.SLA", length=0x200000)
+-        if data is None:
++        if data is None or isinstance(data, bool):
+             return False
+         data = data.decode('utf-8')
+         if "item key=" in data:
+@@ -893,10 +921,13 @@ class DAXML(metaclass=LogBase):
+             tcmd, tresult = self.get_command_result()
+ 
+             class PartitionTable:
+-                def __init__(self, name, start, size):
++                def __init__(self, name, sector, sectors):
+                     self.name = name
+-                    self.start = start
+-                    self.size = size
++                    self.sector = sector    # start offset in pages
++                    self.sectors = sectors  # size in pages
++                    # aliases for compatibility
++                    self.start = sector
++                    self.size = sectors
+ 
+             if tresult == "START":
+                 parttbl = []
+@@ -906,7 +937,7 @@ class DAXML(metaclass=LogBase):
+                     if name != '':
+                         start = get_field(item, "start")
+                         rsize = get_field(item, "size")
+-                        if size == "":
++                        if not rsize:
+                             continue
+                         rsize = int(rsize, 16)
+                         start = int(start, 16)
+@@ -915,30 +946,130 @@ class DAXML(metaclass=LogBase):
+                 return data, parttbl
+         return b"", None
+ 
++    def readflash_by_name(self, partname: str, filename: str, display: bool = True):
++        """Read a named partition via CMD:READ-PARTITION (bypasses NAND-WHOLE offset limit)."""
++        if not self.send_command(self.cmd.cmd_read_partition(partname), noack=True):
++            self.error(f"READ-PARTITION not supported for {partname}")
++            return False
++        cmd, result = self.get_command_result()
++        if type(result) is not UpFile:
++            self.error(f"READ-PARTITION {partname} returned: {result}")
++            return False
++        pre_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
++        data = self.download_raw(result=result, filename=filename, display=display)
++        if filename:
++            post_size = os.path.getsize(filename) if os.path.exists(filename) else 0
++            return post_size > pre_size
++        return bool(data)
++
+     def readflash(self, addr, length, filename, parttype=None, display=True) -> (bytes, bool):
+         partinfo = self.daconfig.storage.get_storage(parttype, length)
+         if not partinfo:
+             return b""
+         storage, parttype, length = partinfo
+ 
+-        if self.send_command(self.cmd.cmd_read_flash(parttype, addr, length), noack=True):
++        # DA firmware delivers at most 0x1A00000 bytes per READ-FLASH session.
++        # Request in explicit batches of that size so each batch terminates cleanly
++        # and the DA may accept the next command.
++        DA_BATCH_LIMIT = 0x1A00000
++        total_written = 0
++        accumulated = bytearray()
++        first_batch = True
++
++        while total_written < length:
++            batch_addr = addr + total_written
++            batch_len = min(DA_BATCH_LIMIT, length - total_written)
++
++            if not self.send_command(self.cmd.cmd_read_flash(parttype, batch_addr, batch_len), noack=True):
++                if total_written == 0:
++                    self.error("Read flash isn't supported")
++                    sys.exit(1)
++                self.warning(f"DA stopped accepting commands after {hex(total_written)} bytes; stopping here")
++                break
++
+             cmd, result = self.get_command_result()
+             if type(result) is not UpFile:
+-                self.error(result)
+-                return b""
+-            data = self.download_raw(result=result, filename=filename, display=display)
+-            scmd, sresult = self.get_command_result()
+-            if sresult == "START":
+-                if not filename:
+-                    return data
+-                else:
+-                    return True
+-            if not filename:
+-                return b""
++                if total_written == 0:
++                    self.error(str(result))
++                    return b"" if not filename else False
++                self.warning(f"DA command result failed after {hex(total_written)} bytes; stopping")
++                break
++
++            pre_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
++            data = self.download_raw(result=result, filename=filename, display=display,
++                                     append_mode=not first_batch)
++            first_batch = False
++
++            if filename:
++                post_size = os.path.getsize(filename) if os.path.exists(filename) else 0
++                batch_written = post_size - pre_size
++            else:
++                batch_written = len(data) if data else 0
++                if data:
++                    accumulated.extend(data)
++
++            if batch_written == 0:
++                self.warning("No data received in batch, stopping")
++                break
++
++            total_written += batch_written
++            self.info(f"Batch done: {hex(batch_written)} bytes, total {hex(total_written)}/{hex(length)}")
++
++            # Consume post-batch DA state (CMD:START signals ready; silence is also OK)
++            try:
++                scmd, sresult = self.get_command_result()
++            except Exception:
++                sresult = ""
++
++            if total_written >= length:
++                break
++
++            if sresult != "START":
++                self.warning(f"DA not ready for next batch (sresult={sresult!r}); stopping at {hex(total_written)}")
++                break
++
++        if not filename:
++            return bytes(accumulated)
++        return total_written > 0
++
++    def writeflash_by_name(self, partname: str, filename: str, display: bool = True) -> bool:
++        """Write a file to a named partition via CMD:WRITE-PARTITION (bypasses NAND-WHOLE offset limit)."""
++        if not os.path.exists(filename):
++            self.error(f"File not found: {filename}")
+             return False
+-        else:
+-            self.error("Read flash isn't supported")
+-            sys.exit(1)
++        length = os.stat(filename).st_size
++        if length % 512 != 0:
++            length += 512 - (length % 512)
++
++        self.send_command(self.cmd.cmd_write_partition_by_name(partition=partname, mem_length=length), noack=True)
++
++        # Consume up to 4 FileSysOp handshake steps before we expect DwnFile
++        for _ in range(4):
++            cmd, result = self.get_command_result()
++            if not isinstance(result, FileSysOp):
++                break
++            if result.key == "EXISTS":
++                # DA asks: partition exists, overwrite? Reply 1 = yes
++                self.ack_value(1)
++            elif result.key == "FILE-SIZE":
++                # DA asks for the data length
++                self.ack_value(length)
++            else:
++                self.error(f"writeflash_by_name: unhandled FileSysOp key {result.key!r}")
++                return False
++
++        if type(result) is DwnFile:
++            with open(filename, "rb") as fh:
++                data = fh.read(length)
++            if len(data) % 512 != 0:
++                data += b"\x00" * (512 - len(data) % 512)
++            if not self.upload(result, data, raw=True):
++                self.error(f"Error uploading {filename} to partition {partname}")
++                return False
++            return True
++
++        self.error(f"writeflash_by_name {partname}: unexpected response {result!r}")
++        return False
+ 
+     def writeflash(self, addr, length, filename, offset=0, parttype=None, wdata=None, display=True):
+         fh = None
+diff --git a/mtkclient/Library/Exploit/exptools/arch.py b/mtkclient/Library/Exploit/exptools/arch.py
+index c56b348..04b3e62 100755
+--- a/mtkclient/Library/Exploit/exptools/arch.py
++++ b/mtkclient/Library/Exploit/exptools/arch.py
+@@ -82,6 +82,8 @@ class ArchTools:
+         return self.decode_bl(instr, pc)
+ 
+     def get_next_bl_from_off(self, offset: int) -> Optional[int]:
++        if offset is None:
++            return None
+         off = offset
+         while off < len(self.data):
+             if self.get_bl_target(off) is not None:
+diff --git a/mtkclient/Library/Exploit/exptools/arm_tools.py b/mtkclient/Library/Exploit/exptools/arm_tools.py
+index 70edd74..2a2e7d7 100644
+--- a/mtkclient/Library/Exploit/exptools/arm_tools.py
++++ b/mtkclient/Library/Exploit/exptools/arm_tools.py
+@@ -1,4 +1,5 @@
+ from typing import Optional, Tuple
++import struct
+ 
+ from mtkclient.Library.Exploit.exptools.arch import ArchTools
+ 
+@@ -86,6 +87,74 @@ class ArmTools(ArchTools):
+         return (instr >> 12) & 0xF
+ 
+ 
++    def is_thumb_mode(self, addr: int) -> bool:
++        """Check if address is in Thumb mode (bit 0 set)."""
++        return (addr & 1) != 0
++
++    def _read_thumb_hw(self, off: int) -> Optional[int]:
++        """Read a Thumb halfword (16-bit instruction)."""
++        if off + 2 > len(self.data):
++            return None
++        return struct.unpack('<H', self.data[off:off+2])[0]
++
++    def _is_thumb32(self, hw: int) -> bool:
++        """Check if a Thumb halfword is the first half of a 32-bit instruction."""
++        # Thumb-2 32-bit instructions start with 0b11101, 0b11110, or 0b11111 in bits [15:11]
++        return (hw & 0xF800) in (0xE800, 0xF000, 0xF800)
++
++    def decode_thumb_ldr_literal(self, instr: int, pc: int) -> Optional[Tuple[int, int]]:
++        """Decode Thumb LDR literal: rt = [pc + imm]."""
++        # Opcode: 0b01001 Rt imm8 (T1) or 0b1111100 u Rt imm12 (T2)
++        if (instr & 0xF800) == 0x4800:  # T1: LDR Rt, [PC, #imm]
++            rt = (instr >> 8) & 0x7
++            imm8 = instr & 0xFF
++            imm = imm8 * 4
++            target = (pc + 4 + imm) & ~3  # PC is aligned, word-aligned
++            return rt, target
++        if (instr & 0xFF7F) == 0xF85F:  # T2: LDR Rt, [PC, #imm12]
++            # This is a 32-bit instruction, need to read second halfword
++            return None  # Not implemented for 32-bit Thumb
++        return None
++
++    def decode_thumb_movw(self, instr: int) -> Optional[Tuple[int, int]]:
++        """Decode Thumb MOVW: rd = imm16."""
++        # Opcode: 0b11110 i imm4 0 rd imm3 imm8 (T3)
++        if (instr & 0xF800) == 0xF240:  # MOVW (T3)
++            i = (instr >> 10) & 1
++            imm4 = (instr >> 16) & 0xF
++            rd = (instr >> 8) & 0x7
++        else:
++            return None
++        # Need second halfword for full imm16
++        return None  # Need 32-bit Thumb support
++
++    def decode_thumb_movt(self, instr: int) -> Optional[Tuple[int, int]]:
++        """Decode Thumb MOVT: rd = (rd & 0xFFFF) | (imm16 << 16)."""
++        # Opcode: 0b11110 i imm4 1 rd imm3 imm8 (T3)
++        if (instr & 0xF800) == 0xF2C0:  # MOVT (T3)
++            i = (instr >> 10) & 1
++            imm4 = (instr >> 16) & 0xF
++            rd = (instr >> 8) & 0x7
++        else:
++            return None
++        # Need second halfword for full imm16
++        return None  # Need 32-bit Thumb support
++
++    def decode_thumb_bl(self, instr: int, pc: int) -> Optional[int]:
++        """Decode Thumb BL: target = pc + 4 + (imm11 << 1) or (imm21 << 1)."""
++        # T1: BL (with immediate): 0b11110 S imm10 J1 J2
++        if (instr & 0xF800) == 0xF000:  # BL (T1/T2)
++            # This is a 32-bit instruction, need second halfword
++            return None  # Need 32-bit Thumb support
++        return None
++
++    def is_thumb_prologue(self, instr: int) -> bool:
++        """Check if instruction is Thumb function prologue (PUSH {regs})."""
++        # Thumb PUSH: 0b10101 0 Rn register_list
++        if (instr & 0xF800) == 0xB400:
++            return True
++        return False
++
+     def find_string_xref(self, s: str) -> Optional[int]:
+         str_off = self.find_string(s)
+         if str_off is None:
+@@ -93,6 +162,8 @@ class ArmTools(ArchTools):
+         str_va = self.base_addr + str_off
+         low16 = str_va & 0xFFFF
+         high16 = (str_va >> 16) & 0xFFFF
++        
++        # ARM32 search (existing)
+         for off in range(0, len(self.data) - 8, 4):
+             instr1 = self.read_u32(off)
+             if instr1 is None:
+@@ -111,7 +182,22 @@ class ArmTools(ArchTools):
+                         break
+                 if found:
+                     return off  # MOVW offset as xref
+-        # Fallback for LDR PC-relative xrefs
++        
++        # Thumb search (new)
++        for off in range(0, len(self.data) - 4, 2):
++            hw1 = self._read_thumb_hw(off)
++            if hw1 is None:
++                continue
++            # Thumb LDR literal
++            pc = self.offset_to_va(off)
++            if pc is not None:
++                ldr = self.decode_thumb_ldr_literal(hw1, pc)
++                if ldr is not None:
++                    rt, addr = ldr
++                    if addr == str_va:
++                        return off
++        
++        # Fallback for LDR PC-relative xrefs (ARM32)
+         for off in range(0, len(self.data) - 4, 4):
+             instr = self.read_u32(off)
+             if instr is None:
+@@ -130,6 +216,8 @@ class ArmTools(ArchTools):
+     def find_function_start_from_off(self, offset: int) -> Optional[int]:
+         limit = 0x2000  # Rust default for backward search
+         search_start = max(0, offset - limit)
++        
++        # ARM32 search (existing)
+         for off in range(offset, search_start - 1, -4):
+             instr = self.read_u32(off)
+             if instr is None:
+@@ -140,6 +228,15 @@ class ArmTools(ArchTools):
+                 if tmp2==0xE3510000 and tmp==0x012FFF1E:
+                     return off-8
+                 return off
++        
++        # Thumb search (new)
++        for off in range(offset, search_start - 1, -2):
++            hw = self._read_thumb_hw(off)
++            if hw is None:
++                continue
++            if self.is_thumb_prologue(hw):
++                return off
++        
+         return None
+ 
+     def decode_sub_imm(self, instr: int) -> Optional[Tuple[int, int, int]]:
+diff --git a/mtkclient/Library/thread_handling.py b/mtkclient/Library/thread_handling.py
+index 6ddf13f..79280d5 100644
+--- a/mtkclient/Library/thread_handling.py
++++ b/mtkclient/Library/thread_handling.py
+@@ -1,10 +1,10 @@
+ from queue import Queue
+-def writedata(filename, rq: Queue):
++def writedata(filename, rq: Queue, mode: str = "wb"):
+     """
+     Optimized writer: uses buffered I/O and larger writes
+     """
+     try:
+-        with open(filename, "wb", buffering=8*1024*1024) as wf:  # 8MB buffer
++        with open(filename, mode, buffering=8*1024*1024) as wf:
+             while True:
+                 block = rq.get(timeout=300)
+                 if block is None:
